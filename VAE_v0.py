@@ -11,28 +11,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
+from torchvision import transforms
 
-from sklearn.manifold import TSNE
 import umap
+from sklearn.manifold import TSNE
 
 # ----------------------------
 # Configuration
 # ----------------------------
-IMG_SIZE = 128
-LATENT_DIM = 32
-BATCH_SIZE = 32
-EPOCHS = 50
+IMG_SIZE = 256
+LATENT_DIM = 128
+BATCH_SIZE = 16
+EPOCHS = 100
 LEARNING_RATE = 1e-4
-BETA = 0.001  # KL weighting (same as original)
+TARGET_BETA = 0.02         # final beta after annealing (try 0.01 - 0.1)
+ANNEAL_EPOCHS = 50         # linear anneal over this many epochs
+BETA_MIN = 0.0            # starting beta
+BATCH_CLIP_NORM = 1.0
+
 DATA_DIR = "/home/groups/comp3710/OASIS"
 TRAIN_DIR = os.path.join(DATA_DIR, "keras_png_slices_train")
 VAL_DIR = os.path.join(DATA_DIR, "keras_png_slices_validate")
 TEST_DIR = os.path.join(DATA_DIR, "keras_png_slices_test")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_WORKERS = 4
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_WORKERS = 1
 SEED = 42
+
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
@@ -43,42 +48,69 @@ if torch.cuda.is_available():
 # Dataset
 # ----------------------------
 class MRIDataset(Dataset):
-    def __init__(self, folder: str, img_size: int = IMG_SIZE, max_samples: int = None):
-        self.paths = list(Path(folder).glob("**/*.png"))
-        if max_samples:
-            self.paths = random.sample(self.paths, min(max_samples, len(self.paths)))
+    def __init__(self, folder: str, max_samples: int = None):
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            raise FileNotFoundError(f"Dataset folder not found: {folder}")
+        # recursive search in case slices are in subfolders
+        self.paths = sorted(folder_path.glob("**/*.png"))
+        if len(self.paths) == 0:
+            raise ValueError(f"No PNG files found in {folder}")
+        if max_samples is not None and max_samples < len(self.paths):
+            self.paths = random.sample(self.paths, max_samples)
+        # Keep values in [0,1] for BCE loss
         self.transform = transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),  # returns [C,H,W] floats in [0,1]
+            transforms.ToTensor(),   # [0,1]
         ])
     def __len__(self):
         return len(self.paths)
     def __getitem__(self, idx):
         p = self.paths[idx]
-        img = Image.open(p).convert("L")
-        img = self.transform(img)  # tensor [1, H, W]
-        return img, str(p)
+        try:
+            img = Image.open(p).convert("L")
+            img = self.transform(img)  # (1,H,W) float in [0,1]
+            return img, str(p)
+        except Exception as e:
+            print(f"[WARN] failed to load {p}: {e}")
+            return torch.zeros((1, IMG_SIZE, IMG_SIZE)), str(p)
+
+def create_data_loaders(batch_size=BATCH_SIZE):
+    # sanity checks
+    for name, path in [("Train", TRAIN_DIR), ("Val", VAL_DIR), ("Test", TEST_DIR)]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{name} directory not found: {path}")
+        n = len(list(Path(path).glob("**/*.png")))
+        print(f"[INFO] {name} set: {n} PNG images")
+    train_ds = MRIDataset(TRAIN_DIR)
+    val_ds = MRIDataset(VAL_DIR)
+    test_ds = MRIDataset(TEST_DIR)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    return train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
 
 # ----------------------------
-# VAE model (Encoder / Decoder)
+# VAE model
+# (Encoder / Decoder tuned for 256x256)
 # ----------------------------
 class Encoder(nn.Module):
     def __init__(self, latent_dim: int, img_size=IMG_SIZE):
         super().__init__()
-        # Input: (B,1,IMG_SIZE,IMG_SIZE)
-        self.conv1 = nn.Conv2d(1, 32, 3, stride=2, padding=1)   # -> (32, IMG/2, IMG/2)
+        # Input (B,1,256,256)
+        self.conv1 = nn.Conv2d(1, 32, 3, stride=2, padding=1)    # -> (32,128,128)
         self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, 3, stride=2, padding=1)  # -> (64, IMG/4, IMG/4)
+        self.conv2 = nn.Conv2d(32, 64, 3, stride=2, padding=1)   # -> (64,64,64)
         self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, 3, stride=2, padding=1) # -> (128, IMG/8, IMG/8)
+        self.conv3 = nn.Conv2d(64, 128, 3, stride=2, padding=1)  # -> (128,32,32)
         self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, 3, stride=2, padding=1) # -> (256, IMG/16, IMG/16)
+        self.conv4 = nn.Conv2d(128, 256, 3, stride=2, padding=1) # -> (256,16,16)
         self.bn4 = nn.BatchNorm2d(256)
+        self.conv5 = nn.Conv2d(256, 512, 3, stride=2, padding=1) # -> (512,8,8)
+        self.bn5 = nn.BatchNorm2d(512)
 
-        final_spatial = img_size // (2**4)  # 128/(2^4)=8 for IMG_SIZE=128
-        self.flatten_dim = 256 * final_spatial * final_spatial
-
+        final_spatial = img_size // (2**5)  # 8 for 256
+        self.flatten_dim = 512 * final_spatial * final_spatial
         self.fc1 = nn.Linear(self.flatten_dim, 512)
         self.dropout = nn.Dropout(0.3)
         self.fc_mu = nn.Linear(512, latent_dim)
@@ -89,6 +121,7 @@ class Encoder(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         x = F.relu(self.bn4(self.conv4(x)))
+        x = F.relu(self.bn5(self.conv5(x)))
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
@@ -99,30 +132,29 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_dim: int, img_size=IMG_SIZE):
         super().__init__()
-        final_spatial = img_size // (2**4)  # should be 8
-        self.fc = nn.Linear(latent_dim, 256 * final_spatial * final_spatial)
-
-        self.deconv1 = nn.ConvTranspose2d(256, 256, 3, stride=2, padding=1, output_padding=1) # 8->16
+        final_spatial = img_size // (2**5)  # 8
+        self.final_spatial = final_spatial
+        self.fc = nn.Linear(latent_dim, 512 * final_spatial * final_spatial)
+        # transpose convs that double spatial dims exactly
+        self.deconv1 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)  # 8->16
         self.bn1 = nn.BatchNorm2d(256)
-        self.deconv2 = nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1) # 16->32
+        self.deconv2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)  # 16->32
         self.bn2 = nn.BatchNorm2d(128)
-        self.deconv3 = nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1)  # 32->64
+        self.deconv3 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)   # 32->64
         self.bn3 = nn.BatchNorm2d(64)
-        self.deconv4 = nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1)   # 64->128
+        self.deconv4 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1)    # 64->128
         self.bn4 = nn.BatchNorm2d(32)
-
-        self.final_conv = nn.Conv2d(32, 1, 3, padding=1)  # keep size same
-        # Use sigmoid in forward for output in [0,1]
+        # final doubling step to 256 - use kernel_size=4,stride=2,padding=1 (no output_padding)
+        self.deconv5 = nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1)     # 128->256
 
     def forward(self, z):
-        final_spatial = IMG_SIZE // (2**4)
-        x = self.fc(z)
-        x = x.view(z.size(0), 256, final_spatial, final_spatial)
+        x = F.relu(self.fc(z))
+        x = x.view(z.size(0), 512, self.final_spatial, self.final_spatial)
         x = F.relu(self.bn1(self.deconv1(x)))
         x = F.relu(self.bn2(self.deconv2(x)))
         x = F.relu(self.bn3(self.deconv3(x)))
         x = F.relu(self.bn4(self.deconv4(x)))
-        x = torch.sigmoid(self.final_conv(x))
+        x = torch.sigmoid(self.deconv5(x))  # ensure [0,1] output
         return x
 
 class VAE(nn.Module):
@@ -130,6 +162,7 @@ class VAE(nn.Module):
         super().__init__()
         self.encoder = Encoder(latent_dim, img_size)
         self.decoder = Decoder(latent_dim, img_size)
+        self.latent_dim = latent_dim
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -143,323 +176,214 @@ class VAE(nn.Module):
         return recon, mu, logvar
 
 # ----------------------------
-# Utilities: loss, early stopping, save/load
+# Loss (dynamic beta)
 # ----------------------------
-def loss_function(recon_x, x, mu, logvar, beta=BETA):
-    # Reconstruction loss: binary cross entropy summed across pixels then averaged across batch
-    # We keep sum over pixels to match TF implementation's reduce_sum axis=(1,2)
-    # PyTorch BCE with reduction='sum' sums across all elements in a batch,
-    # so we'll compute batch-wise and then divide by batch_size for logging if needed.
-    batch_size = x.size(0)
-    recon_loss = F.binary_cross_entropy(recon_x, x, reduction='sum')  # sum over batch
-    # KL divergence per element then sum over latent dims and batch
+def loss_function(recon_x, x, mu, logvar, beta: float):
+    # basic validation
+    if recon_x.shape != x.shape:
+        # crop to minimum spatial dims (last-resort safeguard)
+        min_h = min(recon_x.shape[2], x.shape[2])
+        min_w = min(recon_x.shape[3], x.shape[3])
+        recon_x = recon_x[:, :, :min_h, :min_w]
+        x = x[:, :, :min_h, :min_w]
+    # clamp to avoid log(0)
+    recon_x = torch.clamp(recon_x, 1e-7, 1.0 - 1e-7)
+    x = torch.clamp(x, 0.0, 1.0)
+    recon_loss = F.binary_cross_entropy(recon_x, x, reduction='sum')  # summed over batch
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     total = recon_loss + beta * kld
-    # return values as scalars (not normalized by batch) to match summed TF behaviour
     return total, recon_loss, kld
 
-class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0.0, restore_best=True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.restore_best = restore_best
-        self.best_score = None
-        self.num_bad = 0
-        self.best_state = None
-        self.best_epoch = -1
-
-    def step(self, score, model, epoch):
-        # score is the metric to *minimize* (e.g., val_loss)
-        if self.best_score is None or score < self.best_score - self.min_delta:
-            self.best_score = score
-            self.num_bad = 0
-            if self.restore_best:
-                # deepcopy the model state dict
-                self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                self.best_epoch = epoch
-        else:
-            self.num_bad += 1
-        return self.num_bad >= self.patience
-
-    def restore(self, model):
-        if self.restore_best and self.best_state is not None:
-            model.load_state_dict({k: v.to(next(model.parameters()).device) for k, v in self.best_state.items()})
-            return True
-        return False
-
 # ----------------------------
-# Training loop
+# Utilities: denormalize and visualizations
 # ----------------------------
-def train_vae(
-    vae: VAE,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    epochs: int = EPOCHS,
-    lr: float = LEARNING_RATE,
-    device: torch.device = DEVICE,
-    checkpoint_path: str = "best_vae.pt"
-) -> Tuple[VAE, Dict[str, List[float]]]:
-    vae = vae.to(device)
-    optimizer = torch.optim.Adam(vae.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True, min_lr=1e-6)
-    early_stopper = EarlyStopping(patience=10, restore_best=True)
+def denormalize(tensor):
+    # inputs are in [0,1], so identity - keep for clarity
+    return tensor.clamp(0.0, 1.0)
 
-    history = {"train_loss": [], "train_recon": [], "train_kld": [], "val_loss": [], "val_recon": [], "val_kld": []}
-
-    best_val = float("inf")
-    for epoch in range(1, epochs + 1):
-        vae.train()
-        running_total = 0.0
-        running_recon = 0.0
-        running_kld = 0.0
-        for batch_idx, (imgs, _) in enumerate(train_loader):
-            imgs = imgs.to(device)
-            optimizer.zero_grad()
-            recon, mu, logvar = vae(imgs)
-            total, recon_loss, kld = loss_function(recon, imgs, mu, logvar)
-            total.backward()
-            optimizer.step()
-
-            running_total += total.item()
-            running_recon += recon_loss.item()
-            running_kld += kld.item()
-
-        # Average by number of samples (note: losses above are summed over batch)
-        n_train = len(train_loader.dataset)
-        avg_total = running_total / n_train
-        avg_recon = running_recon / n_train
-        avg_kld = running_kld / n_train
-
-        # Validation
-        vae.eval()
-        val_total = 0.0
-        val_recon = 0.0
-        val_kld_sum = 0.0
-        with torch.no_grad():
-            for imgs, _ in val_loader:
-                imgs = imgs.to(device)
-                recon, mu, logvar = vae(imgs)
-                total_v, recon_v, kld_v = loss_function(recon, imgs, mu, logvar)
-                val_total += total_v.item()
-                val_recon += recon_v.item()
-                val_kld_sum += kld_v.item()
-
-        n_val = len(val_loader.dataset)
-        avg_val_total = val_total / n_val
-        avg_val_recon = val_recon / n_val
-        avg_val_kld = val_kld_sum / n_val
-
-        # Scheduler step uses validation loss (per-sample average)
-        scheduler.step(avg_val_total)
-
-        history["train_loss"].append(avg_total)
-        history["train_recon"].append(avg_recon)
-        history["train_kld"].append(avg_kld)
-        history["val_loss"].append(avg_val_total)
-        history["val_recon"].append(avg_val_recon)
-        history["val_kld"].append(avg_val_kld)
-
-        print(f"Epoch {epoch}/{epochs}  train_loss: {avg_total:.6f}  val_loss: {avg_val_total:.6f}  lr: {optimizer.param_groups[0]['lr']:.2e}")
-
-        # Save best
-        if avg_val_total < best_val:
-            best_val = avg_val_total
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": vae.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": avg_val_total
-            }, checkpoint_path)
-            print(f"Saved best model to {checkpoint_path} (val_loss {best_val:.6f})")
-
-        # Early stopping
-        stop = early_stopper.step(avg_val_total, vae, epoch)
-        if stop:
-            print(f"Early stopping triggered at epoch {epoch}. Restoring best model (epoch {early_stopper.best_epoch})")
-            early_stopper.restore(vae)
-            break
-
-    # load best checkpoint in case early stopper didn't restore to file
-    if os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        vae.load_state_dict(ckpt["model_state_dict"])
-    return vae, history
-
-# ----------------------------
-# Visualization utilities
-# ----------------------------
-def visualize_reconstructions(vae: VAE, dataset: Dataset, device=DEVICE, n_samples=8, out_path="vae_reconstructions.png"):
+def visualize_reconstructions(vae: VAE, dataset: Dataset, n_samples=8, out_path="vae_reconstructions.png", device=DEVICE):
     vae.eval()
-    imgs = []
-    # sample random indices
     indices = np.random.choice(len(dataset), n_samples, replace=False)
-    for idx in indices:
-        x, _ = dataset[idx]
+    imgs = []
+    for i in indices:
+        x, _ = dataset[i]
         imgs.append(x)
     batch = torch.stack(imgs).to(device)
     with torch.no_grad():
         recon, _, _ = vae(batch)
-    batch_np = batch.cpu().numpy()
-    recon_np = recon.cpu().numpy()
-
-    fig, axes = plt.subplots(2, n_samples, figsize=(15, 4))
+    originals = denormalize(batch).cpu().numpy()
+    reconstructions = denormalize(recon).cpu().numpy()
+    fig, axes = plt.subplots(2, n_samples, figsize=(n_samples*1.5, 4))
     for i in range(n_samples):
-        axes[0, i].imshow(batch_np[i, 0], cmap="gray")
+        axes[0, i].imshow(originals[i, 0], cmap="gray", vmin=0, vmax=1)
         axes[0, i].axis("off")
         if i == 0:
-            axes[0, i].set_title("Original")
-        axes[1, i].imshow(recon_np[i, 0], cmap="gray")
+            axes[0, i].set_ylabel("Original")
+        axes[1, i].imshow(reconstructions[i, 0], cmap="gray", vmin=0, vmax=1)
         axes[1, i].axis("off")
         if i == 0:
-            axes[1, i].set_title("Reconstructed")
-    plt.suptitle("VAE Reconstruction Results")
+            axes[1, i].set_ylabel("Reconstructed")
+    plt.suptitle("VAE Reconstructions")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.show()
 
-def visualize_latent_space(vae: VAE, dataset: Dataset, method="umap", n_samples=2000, device=DEVICE, out_prefix="latent_space"):
+def generate_latent_grid(vae: VAE, n_grid=12, out_path="latent_grid.png", device=DEVICE):
     vae.eval()
-    # sample indices
-    if len(dataset) > n_samples:
-        indices = np.random.choice(len(dataset), n_samples, replace=False)
-    else:
-        indices = np.arange(len(dataset))
-    # encode
-    zs = []
-    with torch.no_grad():
-        for i in range(0, len(indices), BATCH_SIZE):
-            batch_idx = indices[i:i+BATCH_SIZE]
-            imgs = [dataset[j][0] for j in batch_idx]
-            imgs = torch.stack(imgs).to(device)
-            _, mu, _ = vae(imgs)
-            zs.append(mu.cpu().numpy())
-    zs = np.vstack(zs)
-    print(f"Latent space shape: {zs.shape}")
-
-    if method.lower() == "umap":
-        print("Applying UMAP...")
-        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="euclidean", random_state=SEED)
-        emb = reducer.fit_transform(zs)
-    else:
-        print("Applying t-SNE...")
-        reducer = TSNE(n_components=2, perplexity=30, random_state=SEED)
-        emb = reducer.fit_transform(zs)
-
-    plt.figure(figsize=(10, 8))
-    sc = plt.scatter(emb[:, 0], emb[:, 1], c=np.arange(len(emb)), cmap="viridis", s=5, alpha=0.6)
-    plt.colorbar(sc, label="Sample Index")
-    plt.xlabel("Component 1")
-    plt.ylabel("Component 2")
-    plt.title(f"VAE Latent Space ({method.upper()})")
-    out_path = f"{out_prefix}_{method}.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.show()
-
-def generate_latent_grid(vae: VAE, n_grid=10, out_path="latent_grid_sampling.png", device=DEVICE):
-    vae.eval()
-    # grid over first 2 latent dims
+    # grid for first two latent dims
     grid_x = np.linspace(-3, 3, n_grid)
     grid_y = np.linspace(-3, 3, n_grid)
     figure = np.zeros((IMG_SIZE * n_grid, IMG_SIZE * n_grid))
     with torch.no_grad():
-        for i, xi in enumerate(grid_x):
-            for j, yi in enumerate(grid_y):
-                z = np.zeros((1, LATENT_DIM), dtype=np.float32)
+        for i, yi in enumerate(grid_y):
+            for j, xi in enumerate(grid_x):
+                z = np.zeros((1, vae.latent_dim), dtype=np.float32)
                 z[0, 0] = xi
                 z[0, 1] = yi
                 z_t = torch.from_numpy(z).to(device)
                 x_dec = vae.decoder(z_t)
                 img = x_dec.cpu().numpy()[0, 0]
                 figure[i * IMG_SIZE: (i + 1) * IMG_SIZE, j * IMG_SIZE: (j + 1) * IMG_SIZE] = img
-    plt.figure(figsize=(12, 12))
-    plt.imshow(figure, cmap="gray")
+    plt.figure(figsize=(10, 10))
+    plt.imshow(figure, cmap="gray", vmin=0, vmax=1)
     plt.axis("off")
-    plt.title("VAE Latent Space Grid Sampling")
+    plt.title("Latent Grid (dims 0 & 1)")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.show()
 
-def plot_training_history(history: Dict[str, List[float]], out_path="training_history.png"):
-    epochs = len(history["train_loss"])
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(history["train_loss"], label="Training")
-    axes[0].plot(history["val_loss"], label="Validation")
-    axes[0].set_title("Total Loss")
-    axes[0].legend()
-    axes[1].plot(history["train_recon"], label="Training")
-    axes[1].plot(history["val_recon"], label="Validation")
-    axes[1].set_title("Reconstruction Loss")
-    axes[1].legend()
-    axes[2].plot(history["train_kld"], label="Training")
-    axes[2].plot(history["val_kld"], label="Validation")
-    axes[2].set_title("KL Loss")
-    axes[2].legend()
-    plt.suptitle("VAE Training History")
-    plt.tight_layout()
+def visualize_umap(vae: VAE, dataset: Dataset, n_samples=2000, method="umap", out_path="latent_umap.png", device=DEVICE):
+    vae.eval()
+    # sample indices
+    if len(dataset) > n_samples:
+        idxs = np.random.choice(len(dataset), n_samples, replace=False)
+    else:
+        idxs = np.arange(len(dataset))
+    zs = []
+    with torch.no_grad():
+        for i in range(0, len(idxs), BATCH_SIZE):
+            batch_idx = idxs[i:i+BATCH_SIZE]
+            imgs = [dataset[j][0] for j in batch_idx]
+            imgs = torch.stack(imgs).to(device)
+            _, mu, _ = vae(imgs)
+            zs.append(mu.cpu().numpy())
+    zs = np.vstack(zs)
+    print(f"[INFO] Latent means shape for UMAP: {zs.shape}")
+    if method.lower() == "umap":
+        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="euclidean", random_state=SEED)
+        emb = reducer.fit_transform(zs)
+    else:
+        from sklearn.manifold import TSNE
+        reducer = TSNE(n_components=2, perplexity=30, random_state=SEED)
+        emb = reducer.fit_transform(zs)
+    plt.figure(figsize=(10, 8))
+    sc = plt.scatter(emb[:, 0], emb[:, 1], c=np.arange(len(emb)), cmap="viridis", s=6, alpha=0.6)
+    plt.colorbar(sc, label="Sample index")
+    plt.title(f"Latent Projection ({method.upper()})")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.show()
 
 # ----------------------------
-# Main
+# Training function with KL annealing
+# ----------------------------
+def train_vae(vae: VAE, train_loader: DataLoader, val_loader: DataLoader, epochs=EPOCHS, lr=LEARNING_RATE, device=DEVICE, checkpoint_path="best_vae.pt"):
+    vae = vae.to(device)
+    optimizer = torch.optim.Adam(vae.parameters(), lr=lr, weight_decay=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, min_lr=1e-6)
+    best_val = float("inf")
+    history = {"train_loss": [], "val_loss": []}
+    for epoch in range(1, epochs + 1):
+        vae.train()
+        running_total = 0.0
+        running_recon = 0.0
+        running_kld = 0.0
+        seen = 0
+        # compute beta for annealing
+        beta = TARGET_BETA * min(1.0, epoch / float(ANNEAL_EPOCHS))
+        for batch_idx, (imgs, _) in enumerate(train_loader):
+            imgs = imgs.to(device)
+            optimizer.zero_grad()
+            recon, mu, logvar = vae(imgs)
+            total, recon_loss, kld = loss_function(recon, imgs, mu, logvar, beta=beta)
+            if torch.isnan(total) or torch.isinf(total):
+                print(f"[WARN] NaN/Inf loss at epoch {epoch}, batch {batch_idx} -- skipping batch")
+                continue
+            total.backward()
+            nn.utils.clip_grad_norm_(vae.parameters(), BATCH_CLIP_NORM)
+            optimizer.step()
+            running_total += total.item()
+            running_recon += recon_loss.item()
+            running_kld += kld.item()
+            seen += imgs.size(0)
+        # compute averages per image
+        avg_train_total = running_total / seen if seen>0 else float('inf')
+        avg_train_recon = running_recon / seen if seen>0 else float('inf')
+        avg_train_kld = running_kld / seen if seen>0 else float('inf')
+
+        # validation
+        vae.eval()
+        val_total = 0.0
+        val_recon = 0.0
+        val_kld = 0.0
+        seen_val = 0
+        with torch.no_grad():
+            for imgs, _ in val_loader:
+                imgs = imgs.to(device)
+                recon, mu, logvar = vae(imgs)
+                # for validation, use full KL (beta does not matter for logging), but we keep beta for consistency
+                total_v, recon_v, kld_v = loss_function(recon, imgs, mu, logvar, beta=beta)
+                val_total += total_v.item()
+                val_recon += recon_v.item()
+                val_kld += kld_v.item()
+                seen_val += imgs.size(0)
+        avg_val_total = val_total / seen_val if seen_val>0 else float('inf')
+        avg_val_recon = val_recon / seen_val if seen_val>0 else float('inf')
+        avg_val_kld = val_kld / seen_val if seen_val>0 else float('inf')
+
+        scheduler.step(avg_val_total)
+        history["train_loss"].append(avg_train_total)
+        history["val_loss"].append(avg_val_total)
+
+        print(f"Epoch {epoch}/{epochs}  train_loss: {avg_train_total:.4f}  val_loss: {avg_val_total:.4f}  beta:{beta:.4f}  lr:{optimizer.param_groups[0]['lr']:.2e}")
+
+        # save best
+        if avg_val_total < best_val:
+            best_val = avg_val_total
+            torch.save({"epoch": epoch, "model_state_dict": vae.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "val_loss": best_val}, checkpoint_path)
+            print(f"[INFO] Saved best model to {checkpoint_path} (val_loss {best_val:.4f})")
+
+    # final load best
+    if os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        vae.load_state_dict(ckpt["model_state_dict"])
+    return vae, history
+
+# ----------------------------
+# Main script
 # ----------------------------
 def main():
-    print("="*50)
-    print("Brain MRI VAE (PyTorch) Training Pipeline")
-    print("="*50)
-    train_ds = MRIDataset(TRAIN_DIR, img_size=IMG_SIZE, max_samples=5000)
-    val_ds = MRIDataset(VAL_DIR, img_size=IMG_SIZE, max_samples=1000)
-    test_ds = MRIDataset(TEST_DIR, img_size=IMG_SIZE, max_samples=1000)
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-
-    vae = VAE(latent_dim=LATENT_DIM, img_size=IMG_SIZE)
-
-    # train
-    vae, history = train_vae(vae, train_loader, val_loader, epochs=EPOCHS, lr=LEARNING_RATE, device=DEVICE, checkpoint_path="best_vae.pt")
-
-    # save final
-    torch.save({"model_state_dict": vae.state_dict()}, "final_vae.pt")
-
-    # Plot history
-    plot_training_history(history)
-
-    # Evaluate on test set (compute avg loss)
-    vae.eval()
-    total = 0.0
-    recon_sum = 0.0
-    kld_sum = 0.0
+    print("="*60)
+    print("Brain MRI VAE (PyTorch) - OASIS")
+    print("="*60)
+    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = create_data_loaders()
+    print("[INFO] Creating VAE model...")
+    vae = VAE(latent_dim=LATENT_DIM, img_size=IMG_SIZE).to(DEVICE)
+    total_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
+    print(f"[INFO] VAE parameters: {total_params:,}")
+    # quick forward pass check
+    sample_batch, _ = next(iter(train_loader))
+    print(f"[INFO] Sample batch shape: {sample_batch.shape}, range: [{sample_batch.min():.3f},{sample_batch.max():.3f}]")
     with torch.no_grad():
-        for imgs, _ in test_loader:
-            imgs = imgs.to(DEVICE)
-            recon, mu, logvar = vae(imgs)
-            t, r, k = loss_function(recon, imgs, mu, logvar)
-            total += t.item()
-            recon_sum += r.item()
-            kld_sum += k.item()
-    n_test = len(test_loader.dataset)
-    print(f"Test avg total: {total / n_test:.6f}, recon: {recon_sum / n_test:.6f}, kld: {kld_sum / n_test:.6f}")
-
-    # Reconstructions
-    visualize_reconstructions(vae, test_ds, device=DEVICE)
-
-    # Latent space
-    visualize_latent_space(vae, test_ds, method="umap", device=DEVICE)
-    visualize_latent_space(vae, test_ds, method="tsne", device=DEVICE)
-
-    # Latent grid
-    generate_latent_grid(vae, n_grid=10, device=DEVICE)
-
-    print("Saved artifacts:")
-    print(" - best_vae.pt")
-    print(" - final_vae.pt")
-    print(" - vae_reconstructions.png")
-    print(" - latent_space_umap.png")
-    print(" - latent_space_tsne.png")
-    print(" - latent_grid_sampling.png")
-    print(" - training_history.png")
-
-    return vae, history
+        recon, mu, logvar = vae(sample_batch.to(DEVICE)[:4])
+        print(f"[INFO] Forward shapes - recon: {recon.shape}, mu: {mu.shape}, logvar: {logvar.shape}")
+    # Train
+    vae, history = train_vae(vae, train_loader, val_loader, epochs=EPOCHS, lr=LEARNING_RATE, device=DEVICE, checkpoint_path="best_vae.pt")
+    torch.save({"model_state_dict": vae.state_dict()}, "final_vae.pt")
+    print("[INFO] Saved final model to final_vae.pt")
+    # Visualizations
+    visualize_reconstructions(vae, test_ds, n_samples=8, out_path="vae_reconstructions.png", device=DEVICE)
+    generate_latent_grid(vae, n_grid=10, out_path="latent_grid.png", device=DEVICE)
+    visualize_umap(vae, test_ds, n_samples=2000, method="umap", out_path="latent_umap.png", device=DEVICE)
+    print("[INFO] Done.")
 
 if __name__ == "__main__":
     main()
